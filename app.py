@@ -19,7 +19,7 @@ st.set_page_config(page_title="Myanmar Video AI Studio", page_icon="🎬", layou
 VOICE = os.getenv("MYANMAR_VOICE", "my-MM-ThihaNeural")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 def secret(name: str, default: str = "") -> str:
