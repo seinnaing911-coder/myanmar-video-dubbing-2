@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import edge_tts
@@ -13,8 +14,9 @@ from faster_whisper import WhisperModel
 from google import genai
 from pydub import AudioSegment
 
-st.set_page_config(page_title="Myanmar Auto Dubbing Studio", page_icon="🎬", layout="centered")
-VOICE = "my-MM-ThihaNeural"
+st.set_page_config(page_title="Myanmar Video AI Studio", page_icon="🎬", layout="centered")
+
+VOICE = os.getenv("MYANMAR_VOICE", "my-MM-ThihaNeural")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -34,7 +36,7 @@ def check_login():
         st.stop()
     if st.session_state.get("authenticated"):
         return
-    st.title("🔐 Private Dubbing Studio")
+    st.title("🔐 Private Myanmar Video Studio")
     with st.form("login_form"):
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Login", use_container_width=True)
@@ -54,12 +56,28 @@ def run_command(command, label):
 
 
 def media_duration(path):
-    value = run_command(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path], "Video ကြာချိန် စစ်ဆေးခြင်း")
+    value = run_command(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        "Video ကြာချိန် စစ်ဆေးခြင်း",
+    )
     return float(value)
 
 
+def parse_json_response(raw: str):
+    raw = (raw or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+    return json.loads(raw)
+
+
+def test_gemini_key(api_key: str):
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(model=GEMINI_MODEL, contents="Reply with exactly: GEMINI_OK")
+    return (response.text or "").strip()
+
+
 def transcribe_video(video_path, progress):
-    progress(0.08, "မူရင်းအသံကို နားထောင်ပြီး တရုတ်/အင်္ဂလိပ် စကားပြောချိန်များ ရှာနေပါသည်။ ပထမအကြိမ်တွင် AI model download လုပ်နိုင်ပါသည်။")
+    progress(0.08, "မူရင်းအသံကို နားထောင်ပြီး စကားပြောချိန်များ ရှာနေပါသည်။")
     model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     segments, info = model.transcribe(video_path, task="transcribe", language=None, beam_size=5, vad_filter=True, vad_parameters={"min_silence_duration_ms": 450})
     found = []
@@ -70,9 +88,7 @@ def transcribe_video(video_path, progress):
             found.append({"id": len(found) + 1, "start": start, "end": end, "source": text})
     if not found:
         raise RuntimeError("မူရင်းအသံထဲမှ စကားပြောသံ မတွေ့ပါ။ Video အသံကို စစ်ဆေးပါ။")
-    language = getattr(info, "language", "unknown")
-    probability = getattr(info, "language_probability", 0.0)
-    return found, language, probability
+    return found, getattr(info, "language", "unknown"), getattr(info, "language_probability", 0.0)
 
 
 def translate_segments(items, api_key, progress):
@@ -81,11 +97,9 @@ def translate_segments(items, api_key, progress):
     batches = [items[i:i + 25] for i in range(0, len(items), 25)]
     for batch_no, batch in enumerate(batches, start=1):
         payload = [{"id": x["id"], "text": x["source"]} for x in batch]
-        prompt = """Translate every item into natural, conversational Burmese (Myanmar language) suitable for voice dubbing. The input may be Chinese or English. Keep the meaning, names and numbers. Do not summarize, omit, or combine lines. Return ONLY a valid JSON array. Each item must have exactly id and myanmar fields, preserving every input id. Example: [{\"id\":1,\"myanmar\":\"မြန်မာဘာသာပြန်\"}]\nINPUT:\n""" + json.dumps(payload, ensure_ascii=False)
+        prompt = "Translate every item into natural conversational Burmese suitable for voice dubbing. Do not summarize, omit, or combine lines. Return ONLY valid JSON with id and myanmar fields.\n" + json.dumps(payload, ensure_ascii=False)
         response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config={"response_mime_type": "application/json"})
-        raw = (response.text or "").strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-        data = json.loads(raw)
+        data = parse_json_response(response.text)
         by_id = {int(x["id"]): str(x["myanmar"]).strip() for x in data}
         for item in batch:
             my = by_id.get(item["id"], "")
@@ -94,6 +108,44 @@ def translate_segments(items, api_key, progress):
             translated.append({**item, "myanmar": my})
         progress(0.12 + 0.15 * batch_no / len(batches), f"မြန်မာဘာသာပြန်နေပါသည် ({min(batch_no * 25, len(items))}/{len(items)})")
     return translated
+
+
+def wait_for_gemini_file(client, uploaded):
+    current = uploaded
+    for _ in range(60):
+        state = getattr(getattr(current, "state", None), "name", "ACTIVE")
+        if state in ("ACTIVE", "SUCCEEDED", "READY"):
+            return current
+        if state in ("FAILED", "ERROR"):
+            raise RuntimeError("Gemini သို့ Video upload လုပ်ရာတွင် မအောင်မြင်ပါ။")
+        time.sleep(2)
+        current = client.files.get(name=current.name)
+    raise RuntimeError("Gemini Video processing အချိန်ကုန်သွားပါသည်။")
+
+
+def create_recap_plan(video_path, api_key, progress, max_clips=10):
+    client = genai.Client(api_key=api_key)
+    progress(0.12, "Recap အတွက် Video ကို Gemini သို့ upload လုပ်နေပါသည်။")
+    uploaded = wait_for_gemini_file(client, client.files.upload(file=video_path))
+    prompt = f"""Analyze this video and create a short Burmese movie/video recap plan.
+Select at most {max_clips} important non-overlapping scenes. Return ONLY a JSON array.
+Each item must have exactly: start (number of seconds), end (number of seconds), narration (natural Burmese narration, 1-3 sentences), title (short Burmese title).
+Use real timestamps, do not invent scenes, and keep narration concise for voice-over.
+"""
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=[uploaded, prompt], config={"response_mime_type": "application/json"})
+    plan = parse_json_response(response.text)
+    duration = media_duration(video_path)
+    clean = []
+    for i, item in enumerate(plan[:max_clips], start=1):
+        start = max(0.0, min(duration, float(item["start"])))
+        end = max(start + 0.2, min(duration, float(item["end"])))
+        narration = str(item["narration"]).strip()
+        if narration and end > start:
+            clean.append({"id": i, "start": start, "end": end, "myanmar": narration, "title": str(item.get("title", "Recap"))})
+    if not clean:
+        raise RuntimeError("Gemini က အသုံးပြုနိုင်သော Recap scene မပြန်ပေးပါ။")
+    progress(0.26, f"Recap scene {len(clean)} ခု ရွေးပြီးပါပြီ။")
+    return clean
 
 
 async def make_tts(text, out_path):
@@ -107,68 +159,106 @@ def make_video_piece(source, start, source_len, target_len, output):
     run_command(["ffmpeg", "-y", "-ss", f"{start:.5f}", "-i", source, "-t", f"{source_len:.5f}", "-an", "-vf", f"setpts={factor:.9f}*(PTS-STARTPTS),fps=30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", output], "Video အပိုင်း အချိန်ညှိခြင်း")
 
 
-def create_dubbed_video(video_path, items, work, progress):
+def write_srt(items, output):
+    def stamp(seconds):
+        ms = int(round(seconds * 1000))
+        h, ms = divmod(ms, 3600000)
+        m, ms = divmod(ms, 60000)
+        s, ms = divmod(ms, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    with open(output, "w", encoding="utf-8") as f:
+        for i, item in enumerate(items, start=1):
+            f.write(f"{i}\n{stamp(item['output_start'])} --> {stamp(item['output_end'])}\n{item['myanmar']}\n\n")
+
+
+def create_recap_video(video_path, items, work, progress, preserve_gaps=False):
     duration = media_duration(video_path)
     async def tts_all():
         paths = []
         for i, item in enumerate(items, start=1):
-            p = os.path.join(work, f"speech_{i:05d}.mp3")
+            p = os.path.join(work, f"recap_speech_{i:05d}.mp3")
             await make_tts(item["myanmar"], p)
             paths.append(p)
-            progress(0.28 + 0.30 * i / len(items), f"မြန်မာအသံ ထုတ်နေပါသည် ({i}/{len(items)})")
+            progress(0.30 + 0.22 * i / len(items), f"မြန်မာအသံ ထုတ်နေပါသည် ({i}/{len(items)})")
         return paths
     speech_paths = asyncio.run(tts_all())
     pieces, timeline, cursor = [], AudioSegment.empty().set_frame_rate(24000).set_channels(1), 0.0
+    output_items = []
     for i, (item, speech_path) in enumerate(zip(items, speech_paths), start=1):
-        start = max(cursor, min(duration, item["start"]))
-        end = max(start, min(duration, item["end"]))
-        if end <= start + 0.04:
-            continue
-        if start > cursor + 0.02:
+        start = max(0.0, min(duration, item["start"]))
+        end = max(start + 0.2, min(duration, item["end"]))
+        speech = AudioSegment.from_file(speech_path).set_channels(1).set_frame_rate(24000)
+        speech_len = max(0.2, len(speech) / 1000.0)
+        if preserve_gaps and start > cursor + 0.02:
             gap = start - cursor
-            gp = os.path.join(work, f"gap_{i:05d}.mp4")
+            gp = os.path.join(work, f"recap_gap_{i:05d}.mp4")
             make_video_piece(video_path, cursor, gap, gap, gp)
             pieces.append(gp)
             timeline += AudioSegment.silent(duration=round(gap * 1000), frame_rate=24000).set_channels(1)
-        speech = AudioSegment.from_file(speech_path).set_channels(1).set_frame_rate(24000)
-        speech_len = len(speech) / 1000.0
-        vp = os.path.join(work, f"speech_video_{i:05d}.mp4")
+        vp = os.path.join(work, f"recap_video_{i:05d}.mp4")
         make_video_piece(video_path, start, end - start, speech_len, vp)
         pieces.append(vp)
+        out_start = len(timeline) / 1000.0
         timeline += speech
+        out_end = len(timeline) / 1000.0
+        output_items.append({**item, "output_start": out_start, "output_end": out_end})
         cursor = end
-        progress(0.60 + 0.20 * i / len(items), f"Video နဲ့ အသံကို အချိန်ကိုက်ညှိနေပါသည် ({i}/{len(items)})")
-    if cursor < duration - 0.02:
+        progress(0.54 + 0.20 * i / len(items), f"Recap clip နဲ့ အသံကို အချိန်ကိုက်ညှိနေပါသည် ({i}/{len(items)})")
+    if preserve_gaps and cursor < duration - 0.02:
         tail = duration - cursor
-        tp = os.path.join(work, "tail.mp4")
+        tp = os.path.join(work, "recap_tail.mp4")
         make_video_piece(video_path, cursor, tail, tail, tp)
         pieces.append(tp)
         timeline += AudioSegment.silent(duration=round(tail * 1000), frame_rate=24000).set_channels(1)
-    if not pieces:
-        raise RuntimeError("ပေါင်းစပ်ရန် Video အပိုင်း မရှိပါ။")
-    concat = os.path.join(work, "concat.txt")
+    concat = os.path.join(work, "recap_concat.txt")
     with open(concat, "w", encoding="utf-8") as f:
         for p in pieces:
             f.write("file '" + p.replace("'", "'\\''") + "'\n")
-    joined = os.path.join(work, "joined.mp4")
-    run_command(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat, "-c", "copy", "-an", "-movflags", "+faststart", joined], "Video အပိုင်းများ ပေါင်းစပ်ခြင်း")
-    mp3 = os.path.join(work, "myanmar_dub.mp3")
+    joined = os.path.join(work, "recap_joined.mp4")
+    run_command(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat, "-c", "copy", "-an", "-movflags", "+faststart", joined], "Recap Video ပေါင်းစပ်ခြင်း")
+    mp3 = os.path.join(work, "myanmar_recap_voice.mp3")
     timeline.export(mp3, format="mp3", bitrate="192k")
-    return joined, mp3, len(timeline) / 1000.0
+    return joined, mp3, output_items, len(timeline) / 1000.0
 
 
-def mux_video(video, audio, output, duration):
-    run_command(["ffmpeg", "-y", "-i", video, "-i", audio, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", f"{duration:.3f}", "-movflags", "+faststart", output], "MP4 ထုတ်လုပ်ခြင်း")
+def mux_video(video, audio, output, duration, subtitle=None):
+    command = ["ffmpeg", "-y", "-i", video, "-i", audio]
+    if subtitle:
+        command += ["-i", subtitle]
+    command += ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", f"{duration:.3f}", "-movflags", "+faststart"]
+    if subtitle:
+        command += ["-map", "2:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=mya"]
+    command += [output]
+    run_command(command, "MP4 ထုတ်လုပ်ခြင်း")
+
+
+def download_video_url(url, work, progress):
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise RuntimeError("yt-dlp မရှိသေးပါ။ requirements.txt ကို install လုပ်ပြီး ပြန်စမ်းပါ။") from exc
+    output = os.path.join(work, "downloaded_video.%(ext)s")
+    progress(0.03, "Video link မှ Video ကို download လုပ်နေပါသည်။")
+    opts = {"outtmpl": output, "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "merge_output_format": "mp4", "noplaylist": True, "quiet": True, "no_warnings": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        raise RuntimeError(f"Video link download မအောင်မြင်ပါ: {exc}") from exc
+    candidates = [p for p in Path(work).glob("downloaded_video.*") if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}]
+    if not candidates:
+        raise RuntimeError("Download ပြီးတဲ့ Video file မတွေ့ပါ။ Link ကို စစ်ဆေးပါ။")
+    return str(candidates[0])
 
 
 check_login()
-st.title("🎬 Myanmar Auto Dubbing Studio")
-st.caption("Video တစ်ဖိုင်တည်းတင်ပါ။ တရုတ်/အင်္ဂလိပ်အသံကို အလိုအလျောက်သိရှိပြီး မြန်မာဘာသာပြန်၊ အသံထုတ်၊ Video ကို Sync လုပ်ပေးပါမည်။")
+st.title("🎬 Myanmar Video AI Studio")
+st.caption("Video file သို့မဟုတ် YouTube/TikTok link မှ မြန်မာ Recap နှင့် Dubbing ပြုလုပ်ပါ။")
 with st.sidebar:
-    st.subheader("အသံဆက်တင်")
+    st.subheader("AI ဆက်တင်")
     st.write(f"မြန်မာအသံ: {VOICE}")
-    st.write(f"Speech recognition: Whisper {WHISPER_MODEL}")
-    st.write(f"Translation: {GEMINI_MODEL}")
+    st.write(f"Whisper: {WHISPER_MODEL}")
+    st.write(f"Gemini: {GEMINI_MODEL}")
     st.caption(f"Upload limit: {MAX_UPLOAD_MB} MB")
     if st.button("Logout", use_container_width=True):
         st.session_state.authenticated = False
@@ -176,39 +266,61 @@ with st.sidebar:
 
 api_key = secret("GEMINI_API_KEY")
 if not api_key:
-    st.warning("ပထမဆုံး Streamlit Secrets ထဲမှာ GEMINI_API_KEY ထည့်ရန် လိုအပ်ပါသည်။")
-video_file = st.file_uploader("မူရင်း Video ကိုသာ Upload လုပ်ပါ", type=["mp4", "mov", "mkv", "webm"])
-st.info("SRT ဖိုင် မလိုပါ။ မူရင်းအသံကို အလိုအလျောက် စာသားပြောင်းပြီး မြန်မာဘာသာပြန်ပါမည်။ မြန်မာအသံကို ပုံမှန်အမြန်နှုန်းထားပြီး အသံနဲ့ကိုက်အောင် Video အပိုင်းကိုသာ အနှေး/အမြန်ညှိပါမည်။")
-if video_file:
-    size_mb = video_file.size / (1024 * 1024)
-    st.write(f"ရွေးထားသော Video: **{video_file.name}** ({size_mb:.1f} MB)")
-    if size_mb > MAX_UPLOAD_MB:
+    st.warning("Streamlit Secrets ထဲတွင် GEMINI_API_KEY ထည့်ရန် လိုအပ်ပါသည်။")
+else:
+    if st.button("🔑 Gemini API Key စမ်းမည်", use_container_width=True):
+        try:
+            st.success(f"Gemini API အလုပ်လုပ်ပါသည်: {test_gemini_key(api_key)}")
+        except Exception as exc:
+            st.error(f"Gemini API Key မအောင်မြင်ပါ: {exc}")
+
+source_mode = st.radio("Video ရင်းမြစ်", ["Upload file", "Video link"], horizontal=True)
+video_file = None
+video_url = ""
+if source_mode == "Upload file":
+    video_file = st.file_uploader("မူရင်း Video ကို Upload လုပ်ပါ", type=["mp4", "mov", "mkv", "webm"])
+else:
+    video_url = st.text_input("YouTube / TikTok / direct video link", placeholder="https://...")
+
+mode = st.radio("လုပ်ဆောင်ချက်", ["AI Movie Recap", "Auto Dubbing"], horizontal=True)
+recap_limit = st.slider("Recap scene အများဆုံးအရေအတွက်", 3, 12, 8) if mode == "AI Movie Recap" else 0
+
+if video_file or video_url.strip():
+    if video_file and video_file.size / (1024 * 1024) > MAX_UPLOAD_MB:
         st.error(f"{MAX_UPLOAD_MB} MB ထက် မကြီးရပါ။")
-    elif st.button("🚀 AUTO DUBBING စတင်မည်", type="primary", use_container_width=True, disabled=not bool(api_key)):
+    elif st.button("🚀 စတင်မည်", type="primary", use_container_width=True, disabled=not bool(api_key)):
         bar, status = st.progress(0), st.empty()
         def progress(v, msg):
             bar.progress(max(0, min(100, int(v * 100))))
             status.info(msg)
         try:
-            with tempfile.TemporaryDirectory(prefix="auto_myanmar_dub_") as work:
-                source = os.path.join(work, "source" + Path(video_file.name).suffix.lower())
-                with open(source, "wb") as f:
-                    f.write(video_file.getbuffer())
-                progress(0.03, "Video ကို စစ်ဆေးနေပါသည်။")
-                items, language, probability = transcribe_video(source, progress)
-                if language not in ("zh", "en"):
-                    st.warning(f"AI က မူရင်းဘာသာစကားကို '{language}' ဟု ခန့်မှန်းထားပါသည်။ တရုတ်/အင်္ဂလိပ်မဟုတ်ပါက ဘာသာပြန်မှားနိုင်ပါသည်။")
-                progress(0.12, f"အသံမှ စာကြောင်း {len(items)} ကြောင်း ရရှိပါသည်။ ခန့်မှန်းဘာသာစကား: {language} ({probability:.0%})")
-                items = translate_segments(items, api_key, progress)
-                joined, mp3, out_duration = create_dubbed_video(source, items, work, progress)
-                mp4 = os.path.join(work, "final_myanmar_dub.mp4")
-                progress(0.84, "နောက်ဆုံး MP4 ဖိုင်ကို ထုတ်လုပ်နေပါသည်။")
-                mux_video(joined, mp3, mp4, out_duration)
+            with tempfile.TemporaryDirectory(prefix="myanmar_video_ai_") as work:
+                if video_file:
+                    source = os.path.join(work, "source" + Path(video_file.name).suffix.lower())
+                    with open(source, "wb") as f:
+                        f.write(video_file.getbuffer())
+                    base_name = Path(video_file.name).stem
+                else:
+                    source = download_video_url(video_url.strip(), work, progress)
+                    base_name = "video_recap"
+                if mode == "AI Movie Recap":
+                    plan = create_recap_plan(source, api_key, progress, recap_limit)
+                else:
+                    items, language, probability = transcribe_video(source, progress)
+                    st.info(f"မူရင်းဘာသာစကား: {language} ({probability:.0%})")
+                    plan = translate_segments(items, api_key, progress)
+                joined, mp3, output_items, out_duration = create_recap_video(source, plan, work, progress, preserve_gaps=(mode == "Auto Dubbing"))
+                mp4 = os.path.join(work, "final_myanmar_video.mp4")
+                srt = os.path.join(work, "myanmar_subtitles.srt")
+                write_srt(output_items, srt)
+                progress(0.86, "နောက်ဆုံး MP4 ကို ထုတ်လုပ်နေပါသည်။")
+                mux_video(joined, mp3, mp4, out_duration, subtitle=srt)
                 st.session_state.result_mp4 = Path(mp4).read_bytes()
                 st.session_state.result_mp3 = Path(mp3).read_bytes()
-                st.session_state.result_name = Path(video_file.name).stem
-                progress(1.0, "ပြီးပါပြီ။ MP4 နဲ့ MP3 ကို Download လုပ်နိုင်ပါပြီ။")
-                st.success(f"ပြီးပါပြီ။ {len(items)} စာကြောင်းကို မြန်မာအသံဖြင့် ထုတ်လုပ်ပြီးပါပြီ။")
+                st.session_state.result_srt = Path(srt).read_bytes()
+                st.session_state.result_name = base_name
+                st.session_state.recap_plan = output_items
+                progress(1.0, "ပြီးပါပြီ။")
         except Exception as exc:
             st.error("လုပ်ဆောင်မှု မအောင်မြင်ပါ။")
             st.exception(exc)
@@ -219,11 +331,16 @@ if st.session_state.get("result_mp4"):
     st.video(st.session_state.result_mp4)
     st.audio(st.session_state.result_mp3, format="audio/mp3")
     base = st.session_state.get("result_name", "video")
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.download_button("⬇️ Download MP4", st.session_state.result_mp4, file_name=f"{base}_myanmar_dub.mp4", mime="video/mp4", use_container_width=True)
+        st.download_button("⬇️ Download MP4", st.session_state.result_mp4, file_name=f"{base}_myanmar.mp4", mime="video/mp4", use_container_width=True)
     with c2:
-        st.download_button("⬇️ Download MP3", st.session_state.result_mp3, file_name=f"{base}_myanmar_dub.mp3", mime="audio/mpeg", use_container_width=True)
+        st.download_button("⬇️ Download MP3", st.session_state.result_mp3, file_name=f"{base}_myanmar.mp3", mime="audio/mpeg", use_container_width=True)
+    with c3:
+        st.download_button("⬇️ Download SRT", st.session_state.result_srt, file_name=f"{base}_myanmar.srt", mime="application/x-subrip", use_container_width=True)
+    with st.expander("Recap script / subtitle စာသား"):
+        for item in st.session_state.get("recap_plan", []):
+            st.write(f"**{item.get('title', 'Scene')}** — {item['myanmar']}")
 
 st.divider()
-st.caption("မှတ်ချက်: ပထမဆုံးအသုံးပြုချိန်တွင် Whisper AI model download လုပ်ရပါမည်။ Video ကြာချိန်နှင့် Server အရ processing အချိန်ကြာနိုင်ပါသည်။")
+st.caption("API key ကို code ထဲ မထည့်ပါနှင့်။ Streamlit Secrets တွင် GEMINI_API_KEY နှင့် APP_PASSWORD ကို သတ်မှတ်ပါ။")

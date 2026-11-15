@@ -1,25 +1,31 @@
-# Myanmar Auto Dubbing Studio
+# Myanmar Video AI Studio
 
-Upload one MP4/MOV/MKV/WEBM video. The app automatically detects speech language (intended for Chinese or English) with Whisper, translates segments to Burmese using Gemini, generates Burmese speech with Edge TTS, and retimes video segments to fit the natural TTS duration. It exports MP4 and MP3.
+Streamlit app for Burmese video dubbing and AI movie/video recap. It supports local upload or a YouTube/TikTok/direct video URL.
+
+## Features
+
+- Gemini API key connection test
+- AI Movie Recap: Gemini analyzes the video, chooses important scenes, writes Burmese narration, and returns MP4, MP3, and SRT subtitles
+- Auto Dubbing: Whisper detects speech, Gemini translates it to Burmese, Edge TTS creates voice, and FFmpeg synchronizes the output
+- API keys stay in Streamlit Secrets and are not committed to GitHub
 
 ## Streamlit Community Cloud setup
 
-1. Replace repository `app.py` with this version.
-2. Replace `requirements.txt` with the supplied version.
-3. Keep `packages.txt` containing `ffmpeg` and keep `.streamlit/config.toml`.
-4. In Streamlit app Settings -> Secrets, keep your existing password and add your Gemini API key:
+1. Deploy this repository as a Streamlit app with `app.py` as the main file.
+2. Keep `packages.txt` containing `ffmpeg`.
+3. In **App settings → Secrets**, add:
 
 ```toml
 APP_PASSWORD = "your-existing-password"
 GEMINI_API_KEY = "your-gemini-api-key"
 ```
 
-Do not put API keys in app.py or commit them to GitHub.
+Do not put API keys in `app.py` or commit them to GitHub.
 
 ## Notes
 
-- SRT upload is no longer required.
-- Whisper `base` multilingual model is downloaded on first run and uses CPU int8.
-- The first run may be slow; Streamlit Community Cloud memory/CPU limits may constrain long videos.
-- Translation requires a valid Gemini API key and may incur API charges.
-- Automatic speech segmentation is approximate; overlapping speakers, music, noisy audio, and very fast speech can reduce accuracy.
+- URL downloading uses `yt-dlp`; platform availability and copyright restrictions still apply.
+- Gemini analyzes the downloaded video for Recap mode, so long videos can use significant quota and memory.
+- Whisper `base` multilingual model downloads on first run and uses CPU int8.
+- Recap subtitles are exported as an SRT file.
+- Streamlit Community Cloud resource limits may constrain long videos.
