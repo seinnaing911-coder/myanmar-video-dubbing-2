@@ -152,6 +152,65 @@ async def make_tts(text, out_path):
     await edge_tts.Communicate(text=text, voice=VOICE).save(out_path)
 
 
+def atempo_filter(factor):
+    """Return an ffmpeg atempo chain for any practical speed adjustment."""
+    factor = max(0.25, min(4.0, float(factor)))
+    filters = []
+    while factor > 2.0:
+        filters.append("atempo=2.0")
+        factor /= 2.0
+    while factor < 0.5:
+        filters.append("atempo=0.5")
+        factor /= 0.5
+    filters.append(f"atempo={factor:.8f}")
+    return ",".join(filters)
+
+
+def fit_audio_to_duration(source, target_seconds, output):
+    """Time-fit one TTS clip without changing pitch, then pad/trim exactly."""
+    source_seconds = media_duration(source)
+    if source_seconds <= 0.01 or target_seconds <= 0.01:
+        raise RuntimeError("အသံအပိုင်းကြာချိန် မမှန်ပါ။")
+    # atempo > 1 speeds up a clip; atempo < 1 slows it down.
+    factor = source_seconds / target_seconds
+    run_command(
+        ["ffmpeg", "-y", "-i", source, "-filter:a",
+         f"{atempo_filter(factor)},aresample=24000,apad=pad_dur={target_seconds:.5f}",
+         "-t", f"{target_seconds:.5f}", "-ac", "1", "-ar", "24000", output],
+        "မြန်မာအသံကို မူရင်းစကားပြောချိန်နှင့် ကိုက်ညီအောင်ညှိခြင်း",
+    )
+
+
+def create_dubbing_audio(video_path, items, work, progress):
+    """Create a full-length Burmese track while preserving the source video timeline."""
+    duration = media_duration(video_path)
+    async def tts_all():
+        paths = []
+        for i, item in enumerate(items, start=1):
+            p = os.path.join(work, f"dub_raw_{i:05d}.mp3")
+            await make_tts(item["myanmar"], p)
+            paths.append(p)
+            progress(0.30 + 0.22 * i / len(items), f"မြန်မာအသံ ထုတ်နေပါသည် ({i}/{len(items)})")
+        return paths
+
+    speech_paths = asyncio.run(tts_all())
+    timeline = AudioSegment.silent(duration=round(duration * 1000), frame_rate=24000).set_channels(1)
+    cursor = 0.0
+    for i, (item, speech_path) in enumerate(zip(items, speech_paths), start=1):
+        start = max(0.0, min(duration, float(item["start"])))
+        end = max(start + 0.2, min(duration, float(item["end"])))
+        target = end - start
+        fitted = os.path.join(work, f"dub_fit_{i:05d}.wav")
+        fit_audio_to_duration(speech_path, target, fitted)
+        speech = AudioSegment.from_file(fitted).set_channels(1).set_frame_rate(24000)
+        timeline = timeline.overlay(speech, position=round(start * 1000))
+        cursor = end
+        progress(0.54 + 0.22 * i / len(items), f"အသံနှင့် မူရင်း video timing ကို ကိုက်ညှိနေပါသည် ({i}/{len(items)})")
+    output = os.path.join(work, "myanmar_dubbing_voice.mp3")
+    timeline.export(output, format="mp3", bitrate="192k")
+    return output, duration
+
+
 def make_video_piece(source, start, source_len, target_len, output):
     if source_len <= 0.04 or target_len <= 0.04:
         raise RuntimeError("Video အပိုင်းကြာချိန် မမှန်ပါ။")
@@ -309,15 +368,22 @@ if video_file or video_url.strip():
                     items, language, probability = transcribe_video(source, progress)
                     st.info(f"မူရင်းဘာသာစကား: {language} ({probability:.0%})")
                     plan = translate_segments(items, api_key, progress)
-                joined, mp3, output_items, out_duration = create_recap_video(source, plan, work, progress, preserve_gaps=(mode == "Auto Dubbing"))
+                if mode == "Auto Dubbing":
+                    # Keep the original frames and any burned-in subtitles untouched.
+                    mp3, out_duration = create_dubbing_audio(source, plan, work, progress)
+                    joined, output_items = source, plan
+                else:
+                    joined, mp3, output_items, out_duration = create_recap_video(source, plan, work, progress, preserve_gaps=False)
                 mp4 = os.path.join(work, "final_myanmar_video.mp4")
                 srt = os.path.join(work, "myanmar_subtitles.srt")
-                write_srt(output_items, srt)
+                if mode == "AI Movie Recap":
+                    write_srt(output_items, srt)
                 progress(0.86, "နောက်ဆုံး MP4 ကို ထုတ်လုပ်နေပါသည်။")
-                mux_video(joined, mp3, mp4, out_duration, subtitle=srt)
+                mux_video(joined, mp3, mp4, out_duration, subtitle=(srt if mode == "AI Movie Recap" else None))
                 st.session_state.result_mp4 = Path(mp4).read_bytes()
                 st.session_state.result_mp3 = Path(mp3).read_bytes()
-                st.session_state.result_srt = Path(srt).read_bytes()
+                st.session_state.result_srt = Path(srt).read_bytes() if mode == "AI Movie Recap" else None
+                st.session_state.result_mode = mode
                 st.session_state.result_name = base_name
                 st.session_state.recap_plan = output_items
                 progress(1.0, "ပြီးပါပြီ။")
@@ -337,7 +403,10 @@ if st.session_state.get("result_mp4"):
     with c2:
         st.download_button("⬇️ Download MP3", st.session_state.result_mp3, file_name=f"{base}_myanmar.mp3", mime="audio/mpeg", use_container_width=True)
     with c3:
-        st.download_button("⬇️ Download SRT", st.session_state.result_srt, file_name=f"{base}_myanmar.srt", mime="application/x-subrip", use_container_width=True)
+        if st.session_state.get("result_srt"):
+            st.download_button("⬇️ Download SRT", st.session_state.result_srt, file_name=f"{base}_myanmar.srt", mime="application/x-subrip", use_container_width=True)
+        else:
+            st.info("Auto Dubbing တွင် မူရင်းစာတန်းကို မပြောင်းပါ။")
     with st.expander("Recap script / subtitle စာသား"):
         for item in st.session_state.get("recap_plan", []):
             st.write(f"**{item.get('title', 'Scene')}** — {item['myanmar']}")
